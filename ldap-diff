@@ -1,0 +1,379 @@
+#! /usr/bin/perl
+
+# ldap-diff:
+
+# Given two LDIF files, compares them, and generates LDIF output that
+# can change the directory that generated the original LDIF file to
+# match the target LDIF file, when used on that original machine with
+# ldapmodify -f.
+
+# TODO:
+# Fix reading of DN from orig LDIF in cases where it is multiline
+# or base64 encoded.
+
+# More urgent: provide an option to ignore the system attributes:
+# entryUUID, entryCSN, createTimestamp, modifyTimestamp.
+
+# Copyright (C) 2009  Nick Urbanik <nicku@nicku.org>
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Net::LDAP::LDIF;
+use Net::LDAP::Entry;
+use Net::LDAP::Util qw(canonical_dn);
+use File::Temp;
+use Data::Dumper;
+use DB_File;
+
+$Data::Dumper::Indent = 1;
+$Data::Dumper::Quotekeys = 0;
+
+# A bit like the shell command comm, but doesn't require the
+# arrays to be sorted.
+# Will include duplicates, E.g.:
+# my @a = ( 1, 2, 1000, 200, 1, 3, 7, 200, 50 );
+# my ( $o, $n, $b ) = adiff [ @a, 1 ], [ @a, 8, 8 ];
+# print "adiff [ \@a, 1 ], [ \@a, 8 ] = '@$o', '@$n', '@$b'\n";
+# adiff [ @a, 1 ], [ @a, 8 ] = '', '8 8', '1 2 1000 200 1 3 7 200 50'
+
+sub adiff {
+    my @old = @{$_[0]};
+    my @new = @{$_[1]};
+    my ( %old, %new );
+    @old{@old} = ();
+    @new{@new} = ();
+    my @only_new = grep { not exists $old{$_} } @new;
+    my @only_old = grep { not exists $new{$_} } @old;
+    my @both = grep { exists $old{$_} } @new;
+    return ( \@only_old, \@only_new, \@both );
+}
+
+# Two array refs:
+# Not equal if unequal lengths;
+# equal if all elements of @$b are found in @$a, in any order, ignoring duplicates.
+# aequal says these pairs are equal:
+# ( 1, 1, 2 ) and ( 2, 1, 2 )
+# ( 1, 2 ) and ( 2, 1 )
+# This is okay for comparing lists of values for one LDAP attribute.
+
+sub aequal {
+    my ( $a, $b ) = @_;
+    return if @$a != @$b;
+    my %seen;
+    @seen{@$a} = ();
+    return ! grep { not exists $seen{$_} } @$b;
+}
+
+# Remove all duplicates from a list, keeping them in the order in
+# which they were first seen.
+
+sub uniq {
+    my %seen;
+    return grep { not $seen{$_}++ } @_;
+}
+
+sub ldif_to_entry {
+    my ( $entry_ldif ) = @_;
+    open my $mem_fh, '<', \$entry_ldif
+	or die "Cannot open memory '$entry_ldif' for reading: $!";
+    my $ldif = Net::LDAP::LDIF->new( $mem_fh, 'r', onerror => 'undef' )
+	or die "Cannot construct Net::LDAP::LDIF object from in-memory ",
+	    "filehandle\n";
+    my $entry = $ldif->read_entry();
+    if ( $ldif->error() ) {
+	warn "Error msg: ", $ldif->error(), "\n";
+	warn "Error lines:\n", $ldif->error_lines(), "\n";
+	$entry = undef;
+    }
+    close $mem_fh or die "Cannot close in-memory file: $!";
+    $ldif->done();
+    return $entry;
+}
+
+my $debug = 0;
+
+sub tie_hash {
+    my %ldif_entry;
+    # Keep the db file if have --debug, else delete it at end.
+    my $fh = File::Temp->new( UNLINK => ! $debug );
+    my $db = $fh->filename();
+    my $dbfile_hashinfo;
+    # See man DB_File and
+    # file:///usr/share/doc/db4-devel-4.7.25/ref/am_conf/cachesize.html
+    $dbfile_hashinfo = new DB_File::HASHINFO;
+    $dbfile_hashinfo->{cachesize} = 256 * 1024 * 1024; # 256 MB!
+    tie %ldif_entry, 'DB_File', $db, O_RDWR|O_CREAT, 0600, $dbfile_hashinfo
+	or die "Cannot tie hash to '$db': $!";
+    return ( $fh, \%ldif_entry );
+}
+
+my $me = $0;
+
+sub put_ldif_into_db {
+    my ($infile, $dbhash) = @_;
+    local $/ = q{}; # paragraph mode
+
+    # Must use two-arg open or gzip won't work:
+    open my $in_fh, $infile or die "Cannot open '$infile': $!";
+    my $num_records = 0;
+
+    RECORD: while (defined(my $record = <$in_fh>)) {
+        # Remove comments, blank lines:
+        $record =~ s{^[ \t]*(?:\#[^\n]*)?\n}{}gxms;
+        next RECORD unless length $record;
+
+        # Each entry in old LDIF is prefixed with a number; remove it:
+        $record =~ s{\A\d+\n}{};
+
+        # Extract the DN from the record
+        my ($dn) = $record =~ m{\Adn::?[ ]*([^\n]+)$}xms;
+        unless (defined $dn) {
+            warn "Cannot find DN in the following record:\n$record";
+            next RECORD;
+        }
+
+        # Normalize the DN (convert to lowercase)
+        $dn = canonical_dn($dn, casefold => 'lower');
+        unless (defined $dn) {
+            warn "Cannot canonicalize DN: '$dn' in the following record:\n$record";
+            next RECORD;
+        }
+
+        # Save the record to the database hash
+        $dbhash->{$dn} = $record;
+        ++$num_records;
+        $0 = "$me $num_records => db" if $num_records % 1000 == 0;
+    }
+
+    close $in_fh or die "Cannot close '$infile': $!";
+    return $num_records;
+}
+
+
+# Return a string if arrayref of length 1 or 0.
+# required to satisfy this in man Net::LDAP::Entry:
+#   'Each "VALUE" should be a string if only a single value is wanted
+#    in the attribute, or a reference to an array of strings if
+#    multiple values are wanted.'
+
+sub deref {
+    my ( $val ) = @_;
+    return $val unless ref $val;
+
+    if ( ref $val eq 'ARRAY' ) {
+	return shift @$val if @$val == 1;
+	return q{} if @$val == 0;
+	return $val;
+    } else {
+	warn "Expected a scalar or arrayref for '$val'\n";
+	return $val;
+    }
+}
+
+my @system_attributes = qw( entryUUID entryCSN createTimestamp modifyTimestamp
+    creatorsName modifiersName structuralObjectClass );
+my $sys_re = join q{|}, @system_attributes;
+
+# Both parameters are of type Net::LDAP::Entry.
+
+# We produce a Net::LDAP::Entry that, if an update( $ldap ) method
+# were called on it, where $ldap is a Net::LDAP connection to the
+# original directory (the one that produced $old), would produce an
+# entry like $new.
+
+# Later we can use the Net::LDAP::LDIR::write_entry() method to
+# produce LDIF with the changes that, when fed to ldapmodify, would
+# make the entry $old change to look like $new.
+
+sub change {
+    my ( $old, $new, $system ) = @_;
+    my @adds = my @deletes = my @replaces = ();
+  ATTR:
+    foreach my $attr ( $old->attributes() ) {
+	next ATTR if not $system and $attr =~ m{^(?:$sys_re)$}io;
+	if ( my @new = $new->get_value( $attr ) ) {
+	    my @old = $old->get_value( $attr );
+	    push @deletes, $attr, [] unless @new;
+	    next ATTR if aequal \@old, \@new;
+	    # Now we have at least one value in each, with at least
+	    # one difference.
+	    my ( $only_old, $only_new, $both ) = adiff \@old, \@new;
+	    push @replaces, $attr => deref $only_new and next ATTR
+		unless @$both;
+	    push @deletes, $attr => deref $only_old if @$only_old;
+	    push @adds, $attr => deref $only_new if @$only_new;
+	}
+    }
+
+    # Any attributes left in $new that are not in $old need to be added:
+  ATTR:
+    foreach my $attr ( $new->attributes() ) {
+	next ATTR if not $system and $attr =~ m{^(?:$sys_re)$}io;
+	push @adds, $attr => deref [ $new->get_value( $attr ) ]
+	    unless defined $old->get_value( $attr );
+    }
+    return unless @adds or @deletes or @replaces;
+    my $entry = Net::LDAP::Entry->new( $new->dn() );
+    print Data::Dumper->Dump( [ \@adds, \@deletes, \@replaces ],
+			      [ qw(*adds *deletes *replaces) ] ) if $debug > 2;
+    print STDERR "Length of adds = '", scalar @adds, "', langth of deletes = '",
+	scalar @deletes, "', length of replaces = '",
+	scalar @replaces, "\n"  if $debug > 1;
+    $entry->changetype( 'modify' );
+    $entry->add( @adds ) if @adds;
+    print 'entry after add: ', Dumper( $entry ) if $debug > 2 and @adds;
+    $entry->delete( @deletes ) if @deletes;
+    print 'entry after deletes: ', Dumper( $entry ) if $debug > 2 and @deletes;
+    $entry->replace( @replaces ) if @replaces;
+    print 'entry after replace: ', Dumper( $entry ) if $debug > 2 and @replaces;
+    return $entry;
+}
+
+sub ldif_modify {
+    my ( $old, $new, $system, $ldif ) = @_;
+    my $entry = change( $old, $new, $system ) or return;
+    return $ldif->write_entry( $entry );
+}
+
+sub ldif_add {
+    my ( $entry, $system, $ldif ) = @_;
+    $entry->changetype( 'add' );
+    $entry->delete( map { $_ => [] } @system_attributes ) unless $system;
+    return $ldif->write_entry( $entry );
+}
+
+# Here we are likely to pass just a DN rather than a blessed reference:
+
+sub ldif_delete {
+    my ( $entry, $ldif ) = @_;
+    $entry = Net::LDAP::Entry->new( $entry )
+	or warn "Cannot make Net::LDAP::Entry->new( $entry )\n"
+	    and return
+		unless ref $entry eq 'Net::LDAP::Entry';
+    $entry->changetype( 'delete' );
+    return $ldif->write_entry( $entry );
+}
+
+sub usage {
+    ( my $prog = $0 ) =~ s{.*/}{};
+    print <<END;
+Usage: $prog --orig=OLD-LDIF --target=TARGET-LDIF [--debug] [--system]
+TARGET-LDIF is a file containing LDIF from the LDAP master
+OLD-LDIF is the incorrect LDIF on the slave.
+
+Produces LDIF suitable for feeding to ldapmodify on the master
+authenticating using the updatedn.
+
+multiple --debug options increase debugging level.
+
+--system includes the system attributes in the LDIF:
+@system_attributes
+Without --system, these are excluded.
+
+TODO:
+Make this work with DNs in the orig file that go over one line,
+or that are base64 encoded, etc.
+END
+    exit 1;
+}
+
+my ( $orig, $target, $system );
+
+GetOptions (
+    'orig=s' => \$orig,
+    'target=s' => \$target,
+    'system!' => \$system,
+    'debug+' => \$debug,
+    help => sub { usage },
+) or usage;
+
+usage unless $orig and $target;
+
+for ( $orig, $target ) { $_ = "zcat $_ |" if /\.gz$/ };
+
+$0 = $me . " reading '$orig'";
+my ( $fh, $ldif_entry_dbhash ) = tie_hash;
+my $num_orig_rec = put_ldif_into_db $orig, $ldif_entry_dbhash;
+
+$0 = $me;
+print STDERR "Found $num_orig_rec record(s) in $orig\n" if $debug;
+
+my $ldiftarget = Net::LDAP::LDIF->new( $target, 'r', onerror => 'undef' );
+
+# The change => 1 parameter causes the LDIF to be written in a form that
+# you can give to ldapmodify to perform the operations required to change
+# the entries in %orig to become those in %target.
+
+my $ldifout
+    = Net::LDAP::LDIF->new( \*STDOUT, 'w', onerror => 'die', change => 1 );
+
+my $newrecords = 0;
+my $mods = my $adds = my $dels = 0;
+
+# Now we read the entries from the new ldif, looking each up in the DB file
+# and generating appropriate LDIF for them.
+
+TARGET_ENTRY:
+while ( not $ldiftarget->eof() ) {
+    my $target_entry = $ldiftarget->read_entry();
+    if ( $ldiftarget->error() ) {
+	warn "Error msg: ", $ldiftarget->error(), "\n";
+	warn "Error lines:\n", $ldiftarget->error_lines(), "\n";
+	next TARGET_ENTRY;
+    }
+    ++$newrecords;
+    $0 = "$me $newrecords $mods $adds $dels" if $newrecords % 500 == 0;
+    my $dn = canonical_dn( $target_entry->dn(), casefold => 'lower' );
+    if ( my $origldif = $ldif_entry_dbhash->{$dn} ) {
+	# Delete the ones we compared so can see what is in orig
+	# that is not in target after comparing all in target:
+	delete $ldif_entry_dbhash->{$dn};
+
+	my $origentry = ldif_to_entry $origldif;
+	++$mods
+	    if ldif_modify $origentry, $target_entry, $system, $ldifout;
+    } else {
+	ldif_add $target_entry, $system, $ldifout;
+	++$adds;
+    }
+}
+
+print STDERR "Finished processing '$target': found $newrecords.  ",
+    "Now remaining entries in '$orig'\n" if $debug;
+
+# Now delete all the entries that are in orig but not in target:
+$0 = "$me last entries in '$orig'";
+while ( my ( $dn, $orig_ldif ) = each %$ldif_entry_dbhash ) {
+    ldif_delete $dn, $ldifout;
+    ++$dels;
+    $0 = "$me $newrecords $mods $adds $dels" if $dels % 200 == 0;
+}
+$ldifout->done();
+
+print STDERR "read $newrecords records from $target, and $num_orig_rec ",
+    "from $orig;\nfound $mods mod@{[ $mods == 1 ? q{} : 's' ]}\n",
+    "$adds add@{[ $adds == 1 ? q{} : 's' ]}\n",
+    "$dels delete@{[ $dels == 1 ? q{} : 's' ]}\n";
+
+untie %$ldif_entry_dbhash or die "Cannot untie hash from '",
+    $fh->filehandle(), "': $!";
+
+print STDERR "DB file is '", $fh->filename(), "'\n" if $debug;
+
+__END__
