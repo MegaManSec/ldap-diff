@@ -141,22 +141,15 @@ sub put_ldif_into_db {
         # Each entry in old LDIF is prefixed with a number; remove it:
         $record =~ s{\A\d+\n}{};
 
-        # Extract the DN from the record
-        my ($dn) = $record =~ m{\Adn::?[ ]*([^\n]+)$}xms;
-        unless (defined $dn) {
-            warn "Cannot find DN in the following record:\n$record";
-            next RECORD;
-        }
-
-        # Normalize the DN (convert to lowercase)
-        $dn = canonical_dn($dn, casefold => 'lower');
-        unless (defined $dn) {
-            warn "Cannot canonicalize DN: '$dn' in the following record:\n$record";
+        # Extract the entryUUID from the record
+        my ($uuid) = $record =~ m{entryUUID::?[ ]*([^\n]+)$}xms;
+        unless (defined $uuid) {
+            warn "Cannot find entryUUID in the following record:\n$record";
             next RECORD;
         }
 
         # Save the record to the database hash
-        $dbhash->{$dn} = $record;
+        $dbhash->{$uuid} = $record;
         ++$num_records;
         $0 = "$me $num_records => db" if $num_records % 1000 == 0;
     }
@@ -339,11 +332,11 @@ while ( not $ldiftarget->eof() ) {
     }
     ++$newrecords;
     $0 = "$me $newrecords $mods $adds $dels" if $newrecords % 500 == 0;
-    my $dn = canonical_dn( $target_entry->dn(), casefold => 'lower' );
-    if ( my $origldif = $ldif_entry_dbhash->{$dn} ) {
+    my $uuid = $target_entry->get_value('entryUUID');
+    if ( my $origldif = $ldif_entry_dbhash->{$uuid} ) {
 	# Delete the ones we compared so can see what is in orig
 	# that is not in target after comparing all in target:
-	delete $ldif_entry_dbhash->{$dn};
+	delete $ldif_entry_dbhash->{$uuid};
 
 	my $origentry = ldif_to_entry $origldif;
 	++$mods

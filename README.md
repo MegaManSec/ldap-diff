@@ -6,16 +6,16 @@ Based on 'orig' (old) and 'target' (new) dumps, the perl script creates an .ldif
 
 The original ldap-diff compared distinguished names in the files to compare results, however it is possible to modify an entry's distinguished name with a modrdn operation.
 
-Therefore, there is a slight change in the code here which defines unique entries based on their uuid, not their distinguished name, meaning it is able to keep track of changes involving the same entry but with different distinguished names.
+Therefore, there is a slight change in the code here which defines unique entries based on their entryUUID (which _are_ unique per entry), not their distinguished name, meaning it is able to keep track of changes involving the same entry but with different distinguished names.
 
 
 ## Usage
 
 ```
-$ ldapsearch -o ldif-wrap=no -x -LLL -H ldaps://ldap.local -b dc=rabbit,dc=com '(&(|(objectClass=inetOrgPerson)(objectClass=groupOfNames)))' > ldap.new
+$ ldapsearch -o ldif-wrap=no -x -LLL -H ldaps://ldap.local -b dc=rabbit,dc=com '(&(|(objectClass=inetOrgPerson)(objectClass=groupOfNames)))' '*' '+' > ldap.new
 $ sleep 360
 $ mv ldap.new ldap.old
-$ ldapsearch -o ldif-wrap=no -x -LLL -H ldaps://ldap.local -b dc=rabbit,dc=com '(&(|(objectClass=inetOrgPerson)(objectClass=groupOfNames)))' > ldap.new
+$ ldapsearch -o ldif-wrap=no -x -LLL -H ldaps://ldap.local -b dc=rabbit,dc=com '(&(|(objectClass=inetOrgPerson)(objectClass=groupOfNames)))' '*' '+' > ldap.new
 $ perl ./ldap-diff  --orig ldap.old --target ldap.new
 
 dn: cn=superadmins,ou=Groups,dc=rabbit,dc=com
